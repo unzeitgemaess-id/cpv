@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""
+cpv  : seperti `cp -r`, tapi data dipaksa tertulis ke perangkat + progres realtime.
+mvv  : seperti `mv`, sumber baru dihapus setelah data benar-benar aman di tujuan.
+
+Satu file untuk dua perintah: `mvv` adalah symlink ke `cpv`.
+Setelah selesai, perangkat sudah di-sync sehingga aman di-eject.
+Tambahkan -e untuk sekaligus unmount + power-off flashdisk.
+"""
+import argparse
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+CHUNK = 4 * 1024 * 1024        # ukuran baca/tulis per putaran
+SYNC_EVERY = 16 * 1024 * 1024  # paksa tulis ke perangkat tiap sekian byte
+ERRORS = []
+
+BRAILLE = ["\u2800", "\u2840", "\u28C0", "\u28C4", "\u28E4",
+           "\u28E6", "\u28F6", "\u28F7", "\u28FF"]
+GREEN = "\x1b[38;2;70;220;110m"  # bagian terisi
+TRACK = "\x1b[38;2;40;60;48m"    # jejak kosong (redup)
+RESET = "\x1b[0m"
+
+
+# ---------- format ----------
+def fmt_size(n):
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or u == "TB":
+            return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
+
+
+def fmt_time(s):
+    s = int(s)
+    h, r = divmod(s, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+# ---------- progres ----------
+class Progress:
+    def __init__(self, total, nfiles, enabled):
+        self.total = total
+        self.nfiles = nfiles
+        self.enabled = enabled and sys.stderr.isatty()
+        self.done = 0
+        self.fidx = 0
+        self.name = ""
+        self.start = time.monotonic()
+        self.last_t = self.start
+        self.last_b = 0
+        self.speed = 0.0
+        self.last_draw = 0.0
+        self.drawn = False
+
+    def begin_file(self, name):
+        self.fidx += 1
+        self.name = name
+        self.draw(True)
+
+    def add(self, n):
+        self.done += n
+        self.draw()
+
+    def draw(self, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_draw < 0.1:
+            return
+        dt = now - self.last_t
+        if dt >= 0.5:
+            inst = (self.done - self.last_b) / dt
+            self.speed = inst if self.speed == 0 else 0.7 * self.speed + 0.3 * inst
+            self.last_t = now
+            self.last_b = self.done
+        self.last_draw = now
+        if not self.enabled:
+            return
+        cols = shutil.get_terminal_size((80, 20)).columns
+        pct = min(1.0, self.done / self.total) if self.total else 1.0
+        eta = (self.total - self.done) / self.speed if self.speed > 0 else 0
+        info = f" {pct * 100:5.1f}%  {fmt_size(self.speed)}/s  sisa {fmt_time(eta)}"
+        bw = max(10, cols - len(info) - 2)
+        units = pct * bw * 8
+        full = int(units // 8)
+        part = int(units % 8)
+        bar = GREEN + BRAILLE[8] * full
+        if full < bw:
+            bar += BRAILLE[part] if part > 0 else ""
+            rest = bw - full - (1 if part > 0 else 0)
+            bar += TRACK + "\u28C0" * rest
+        bar += RESET
+        pct_txt, _, tail = info.lstrip().partition("%")
+        info_col = f" {GREEN}{pct_txt}%{RESET}{tail}"
+        head = f"({self.fidx}/{self.nfiles}) {fmt_size(self.done)} / {fmt_size(self.total)}  {self.name}"
+        head = head[: cols - 1]
+        out = "\033[2A" if self.drawn else "\033[?25l"
+        out += f"\r\033[K{head}\n\r\033[K{bar}{info_col}\n"
+        sys.stderr.write(out)
+        sys.stderr.flush()
+        self.drawn = True
+
+
+# ---------- util berkas ----------
+def fsync_dir(path):
+    try:
+        fd = os.open(path or ".", os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def build_plan(src, dst, items):
+    if os.path.islink(src):
+        items.append(("link", src, dst, 0))
+    elif os.path.isdir(src):
+        items.append(("dir", src, dst, 0))
+        for name in sorted(os.listdir(src)):
+            build_plan(os.path.join(src, name), os.path.join(dst, name), items)
+    elif stat.S_ISREG(os.stat(src).st_mode):
+        items.append(("file", src, dst, os.path.getsize(src)))
+    else:
+        items.append(("skip", src, dst, 0))
+
+
+def copy_file(src, dst, size, prog):
+    tmp = dst + ".cpp-part"
+    buf = bytearray(CHUNK)
+    view = memoryview(buf)
+    try:
+        with open(src, "rb", buffering=0) as fi, open(tmp, "wb", buffering=0) as fo:
+            since = 0
+            while True:
+                n = fi.readinto(buf)
+                if not n:
+                    break
+                fo.write(view[:n])
+                prog.add(n)
+                since += n
+                if since >= SYNC_EVERY:
+                    os.fdatasync(fo.fileno())  # progres jadi sesuai kecepatan flashdisk asli
+                    since = 0
+            os.fsync(fo.fileno())
+        try:
+            shutil.copystat(src, tmp)
+        except OSError:
+            pass  # FAT/exFAT tidak mendukung semua atribut
+        if os.path.getsize(tmp) != size:
+            raise OSError("ukuran hasil salinan tidak cocok")
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def run_job(src, dst, move, args, prog, items):
+    # mvv di filesystem yang sama: cukup rename (instan)
+    if move and not args.no_clobber:
+        try:
+            parent = os.path.dirname(os.path.abspath(dst))
+            if os.stat(parent).st_dev == os.lstat(src).st_dev:
+                os.rename(src, dst)
+                prog.add(sum(i[3] for i in items))
+                fsync_dir(parent)
+                fsync_dir(os.path.dirname(os.path.abspath(src)))
+                return
+        except OSError:
+            pass  # lanjut ke salin + hapus
+
+    errors = 0
+    keep_source = False
+    dirs_to_sync = set()
+    for kind, s, d, size in items:
+        try:
+            if kind == "dir":
+                os.makedirs(d, exist_ok=True)
+                dirs_to_sync.update((d, os.path.dirname(d)))
+            elif kind == "link":
+                if os.path.lexists(d):
+                    os.remove(d)
+                os.symlink(os.readlink(s), d)
+                dirs_to_sync.add(os.path.dirname(d))
+            elif kind == "file":
+                prog.begin_file(os.path.basename(s))
+                if args.no_clobber and os.path.exists(d):
+                    prog.add(size)
+                    keep_source = True
+                    continue
+                copy_file(s, d, size, prog)
+                dirs_to_sync.add(os.path.dirname(d))
+            else:
+                keep_source = True
+                ERRORS.append(f"{s}: bukan berkas biasa, dilewati")
+        except OSError as e:
+            errors += 1
+            ERRORS.append(f"{s}: {e}")
+
+    for d in dirs_to_sync:
+        fsync_dir(d)
+
+    if move and errors == 0 and not keep_source:
+        try:
+            if os.path.isdir(src) and not os.path.islink(src):
+                shutil.rmtree(src)
+            else:
+                os.remove(src)
+            fsync_dir(os.path.dirname(os.path.abspath(src)))
+        except OSError as e:
+            ERRORS.append(f"gagal menghapus sumber {src}: {e}")
+
+
+def resolve(sources, dest):
+    if len(sources) > 1 or os.path.isdir(dest):
+        if not os.path.isdir(dest):
+            sys.exit(f"{dest}: bukan direktori")
+        return [(s, os.path.join(dest, os.path.basename(s.rstrip("/")))) for s in sources]
+    return [(sources[0], dest)]
+
+
+def eject(path):
+    def run(cmd):
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    try:
+        dev = run(["findmnt", "-no", "SOURCE", "--target", path]).stdout.strip()
+        target = run(["findmnt", "-no", "TARGET", "--target", path]).stdout.strip()
+        if not dev.startswith("/dev/") or not target.startswith(("/media/", "/run/media/", "/mnt/")):
+            print(f"Eject dilewati: {target or path} bukan flashdisk/media eksternal.")
+            return
+        parent = run(["lsblk", "-no", "PKNAME", dev]).stdout.strip().splitlines()
+        r = run(["udisksctl", "unmount", "-b", dev])
+        if r.returncode != 0:
+            print("Gagal unmount:", (r.stderr or r.stdout).strip())
+            return
+        print(r.stdout.strip())
+        if parent:
+            r = run(["udisksctl", "power-off", "-b", "/dev/" + parent[0]])
+            print((r.stdout or r.stderr).strip() or "Perangkat dimatikan.")
+    except FileNotFoundError as e:
+        print(f"Eject gagal, perintah tidak ditemukan: {e.filename}")
+
+
+def main():
+    name = os.path.basename(sys.argv[0])
+    move = name.startswith("mvv")
+    ap = argparse.ArgumentParser(
+        prog=name,
+        description=("Pindah" if move else "Salin")
+        + " berkas/folder, dijamin tertulis ke perangkat, dengan progres realtime.",
+    )
+    ap.add_argument("paths", nargs="+", metavar="SUMBER... TUJUAN")
+    ap.add_argument("-n", "--no-clobber", action="store_true", help="jangan timpa berkas yang sudah ada")
+    ap.add_argument("-e", "--eject", action="store_true", help="unmount + power-off perangkat tujuan setelah selesai")
+    ap.add_argument("-q", "--quiet", action="store_true", help="tanpa indikator progres")
+    args = ap.parse_args()
+    if len(args.paths) < 2:
+        ap.error("butuh minimal satu sumber dan satu tujuan")
+
+    sources, dest = args.paths[:-1], args.paths[-1]
+    pairs = resolve(sources, dest)
+
+    jobs, total, nfiles = [], 0, 0
+    for s, d in pairs:
+        if not os.path.lexists(s):
+            ERRORS.append(f"{s}: tidak ditemukan")
+            continue
+        rs, rd = os.path.realpath(s), os.path.realpath(d)
+        if rs == rd or (os.path.isdir(s) and rd.startswith(rs + os.sep)):
+            ERRORS.append(f"{s}: tidak bisa ke dirinya sendiri / ke dalam dirinya")
+            continue
+        items = []
+        build_plan(s, d, items)
+        total += sum(i[3] for i in items)
+        nfiles += sum(1 for i in items if i[0] == "file")
+        jobs.append((s, d, items))
+
+    prog = Progress(total, max(1, nfiles), not args.quiet)
+    try:
+        for s, d, items in jobs:
+            run_job(s, d, move, args, prog, items)
+        prog.name = "Menyinkronkan ke perangkat..."
+        prog.draw(True)
+        os.sync()
+        if not ERRORS:
+            prog.done = prog.total
+        prog.name = "Selesai"
+        prog.draw(True)
+    except KeyboardInterrupt:
+        sys.stderr.write("\033[?25h\nDibatalkan. Berkas parsial dibersihkan, sumber tidak disentuh.\n")
+        sys.exit(130)
+
+    if prog.drawn:
+        sys.stderr.write("\033[?25h")
+    elapsed = max(time.monotonic() - prog.start, 1e-6)
+    print(f"{fmt_size(total)} dalam {fmt_time(elapsed)} (rata-rata {fmt_size(total / elapsed)}/s)")
+    for e in ERRORS:
+        print("ERROR:", e, file=sys.stderr)
+    if ERRORS:
+        sys.exit(1)
+    if args.eject and pairs:
+        d = pairs[0][1]
+        eject(d if os.path.isdir(d) else os.path.dirname(os.path.abspath(d)))
+    else:
+        print("Data sudah tertulis penuh. Aman untuk di-eject.")
+
+
+if __name__ == "__main__":
+    main()
